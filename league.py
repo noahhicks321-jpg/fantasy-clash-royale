@@ -1,992 +1,340 @@
-
-# league.py
-# Clash Royale Fantasy League backend
-# -----------------------------------------------------------------------------
-# This file contains a self-contained simulation engine that the Streamlit UI
-# (app.py) can import. It was designed to satisfy every feature the app expects
-# while remaining readable and extensible.
-#
-# You will find:
-#   • Data classes for Card and Team
-#   • League class handling: initialization, preseason (draft/backups),
-#     schedule generation, day-by-day simulation, fatigue management,
-#     backup-substitution rules, trades, salary-cap shop, awards,
-#     playoffs (16 teams: BO3, BO5, BO5, BO7), patches, retirements,
-#     rookies, league history archive, HOF probability tracking, etc.
-#
-# Notes on philosophy:
-#   - This is a *toy* simulator that focuses on UX and "league worldbuilding"
-#     over deep esports accuracy. We model sensible formulas (documented below),
-#     but keep computations lightweight to ensure Streamlit stays snappy.
-#   - Nearly every top-level method returns simple Python types so that the UI
-#     can render with minimal fuss (dicts/lists/strings — no Pandas requirement).
-#
-# -----------------------------------------------------------------------------
-from __future__ import annotations
-
 import json
-import math
+import os
 import random
-import statistics
-from dataclasses import dataclass, asdict, field
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import List, Dict, Optional, Tuple
 
-SAVE_FILE = "league_state.json"
-RNG_SEED = 1337
+SAVE_FILE = "league_save.json"
 
-# =============================================================================
-# Utility helpers
-# =============================================================================
-
-def clamp(v: float, lo: float = 0.0, hi: float = 100.0) -> float:
-    return max(lo, min(hi, v))
-
-def weighted_choice(items: List[Tuple[Any, float]]) -> Any:
-    total = sum(w for _, w in items)
-    r = random.uniform(0, total) if total > 0 else 0
-    upto = 0
-    for item, w in items:
-        if upto + w >= r:
-            return item
-        upto += w
-    return items[-1][0] if items else None
-
-def uid(prefix: str, n: int = 6) -> str:
-    import string, random
-    return f"{prefix}_{''.join(random.choices(string.ascii_uppercase+string.digits, k=n))}"
-
-# =============================================================================
-# Core data structures
-# =============================================================================
-
-ARCHETYPES = ["Tank", "DPS", "Control", "Support", "Hybrid"]
-ATTACK_TYPES = ["Melee", "Ranged", "Splash", "Magic"]
-
-# -- Synergy matrix: additive bonus/penalty (±5 typical), returns a /100 bonus.
-SYNERGY_MATRIX: Dict[Tuple[str, str], float] = {}
-def _build_synergy():
-    # symmetric entries for clarity
-    pairs = {
-        ("Tank","Support"): +5, ("Tank","DPS"): +2, ("Tank","Control"): -2, ("Tank","Hybrid"): +1,
-        ("DPS","Support"): +1, ("DPS","Control"): +2, ("DPS","Hybrid"): +1,
-        ("Control","Support"): +3, ("Control","Hybrid"): +1,
-        ("Support","Hybrid"): +2,
-        ("Tank","Tank"): -3, ("DPS","DPS"): -2, ("Control","Control"): -1, ("Support","Support"): 0, ("Hybrid","Hybrid"): 0,
-    }
-    for a in ARCHETYPES:
-        for b in ARCHETYPES:
-            if (a,b) in pairs:
-                SYNERGY_MATRIX[(a,b)] = pairs[(a,b)]
-                SYNERGY_MATRIX[(b,a)] = pairs[(a,b)]
-            elif (b,a) in pairs:
-                SYNERGY_MATRIX[(a,b)] = pairs[(b,a)]
-            else:
-                SYNERGY_MATRIX[(a,b)] = 0.0
-
-_build_synergy()
-
-def synergy_bonus(a: str, b: str) -> float:
-    return SYNERGY_MATRIX.get((a,b), 0.0)
-
-# -----------------------------------------------------------------------------
-
-@dataclass
+# ---------------------- Data Classes ----------------------
 class Card:
-    """Represents a single card (a 'player' in this fantasy league).
+    def __init__(self, cid: str, name: str, archetype: str, attack_type: str,
+                 attack: int, defense: int, speed: int, stamina: int, special: int,
+                 cost: float, age: int = 0, lifespan: int = 8, retired: bool = False):
+        self.id = cid
+        self.name = name
+        self.archetype = archetype
+        self.attack_type = attack_type
+        self.attack = attack
+        self.defense = defense
+        self.speed = speed
+        self.stamina = stamina
+        self.special = special
+        self.base_cost = cost
+        self.cost = cost
+        self.age = age
+        self.lifespan = lifespan
+        self.retired = retired
+        self.awards: List[str] = []
+        self.history: List[Dict] = []
 
-    All primary stats are /100 except cost (salary points) and age/lifespan.
-    """
-    id: str
-    name: str
-    archetype: str
-    attack_type: str
-
-    # Primary stats (0–100)
-    attack: int
-    defense: int
-    speed: int
-    hit_speed: int              # card-specific tempo; higher = more hits
-    atk_type_score: int         # meta bonus for attack_type
-    synergy_score: int          # innate team-friendliness
-
-    # Derived & meta
-    total_power: int            # /100 average of core stats + synergy bonuses
-    grade: str                  # S/A/B/C/D
-    cost: float                 # salary points (<= 20 per team)
-    base_cost: float
-    age: int                    # seasons played so far
-    lifespan: int               # total seasons before forced retirement (3–8)
-    retired: bool = False
-    awards: List[str] = field(default_factory=list)
-    history: List[Dict[str, Any]] = field(default_factory=list)  # per-season snapshots
-    hof_prob: float = 0.0       # 0–100 tracker
-
-    # Usage & contribution tracking (reset each season)
-    games_played: int = 0
-    contribution_sum: float = 0.0   # cumulative % contribution
-    avg_pct_contributed: float = 0.0
-    pick_rate: float = 0.0          # pick % (drafted frequency)
-    fatigue: float = 100.0          # 0–100 (backup used if starter fatigue < threshold)
-
-    def to_dict(self) -> Dict[str, Any]:
-        d = asdict(self)
-        return d
-
-# -----------------------------------------------------------------------------
-
-@dataclass
-class Team:
-    id: str
-    name: str
-    logo: str
-    color: str
-    gm_personality: str
-
-    roster: List[str]      # 3 starters -> list of Card IDs
-    backup: Optional[str]  # backup Card ID
-    wins: int = 0
-    losses: int = 0
-    streak: int = 0
-    cost_spent: float = 0.0
-    shop_points_left: float = 0.0
-    boosts: List[Dict[str, Any]] = field(default_factory=list)
-
-    # One card trade + one pick trade per season (can be combined in one)
-    trade_card_used: bool = False
-    trade_pick_used: bool = False
-
-    # GM Career tracking (meta progression)
-    career_titles: int = 0
-    career_trades_won: int = 0
-    career_trades_lost: int = 0
-    career_seasons: int = 0
-
-    # Chemistry system (0–100 per card pair)
-    chemistry: Dict[Tuple[str, str], float] = field(default_factory=dict)
-
-# =============================================================================
-# League
-# =============================================================================
-
-class League:
-    """Top-level simulation container.
-
-    Public attributes the UI depends on:
-      - teams: List[Team]
-      - cards: Dict[card_id, Card]
-      - schedule: List[(day, home_idx, away_idx)]
-      - rivalries: Dict[(team_i, team_j), {games,a_wins,b_wins}]
-      - transactions: List[str]
-      - results: List[Dict]  (game recaps)
-      - playoffs: Dict with 'bracket', 'results', 'champion'
-      - past_seasons: Dict[season_num, {...}]
-      - shop_catalog: List[Dict] items for UI
-
-    Methods the UI calls are documented inline below.
-    """
-    def __init__(self, n_teams: int = 30, rng_seed: int = RNG_SEED):
-        random.seed(rng_seed)
-        self.rng_seed = rng_seed
-        self.season: int = 1
-        self.day: int = 1
-        self.max_team_cost: float = 20.0
-        self.cards: Dict[str, Card] = {}
-        self.teams: List[Team] = []
-        self.schedule: List[Tuple[int, int, int]] = []  # (day, home_i, away_i)
-        self.rivalries: Dict[Tuple[int, int], Dict[str, int]] = {}
-        self.transactions: List[str] = []
-        self.results: List[Dict[str, Any]] = []
-        self.playoffs: Dict[str, Any] = {}
-        self.past_seasons: Dict[int, Dict[str, Any]] = {}
-        self.records: Dict[str, Any] = {
-            "worst_record": None,
-            "best_record": None,
-            "biggest_upset": None,
-            "most_awards_one_season": None,
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "name": self.name,
+            "archetype": self.archetype,
+            "attack_type": self.attack_type,
+            "attack": self.attack,
+            "defense": self.defense,
+            "speed": self.speed,
+            "stamina": self.stamina,
+            "special": self.special,
+            "base_cost": self.base_cost,
+            "cost": self.cost,
+            "age": self.age,
+            "lifespan": self.lifespan,
+            "retired": self.retired,
+            "awards": self.awards,
+            "history": self.history,
         }
 
-        # Shop items
-        self.shop_catalog: List[Dict[str, Any]] = [
-            {"key": "boost_atk_+3_2g", "label": "Attack +3 (2 games)", "pts": 1.5, "stat": "attack", "amount": 3, "games": 2, "teamwide": False},
-            {"key": "boost_def_+3_2g", "label": "Defense +3 (2 games)", "pts": 1.5, "stat": "defense", "amount": 3, "games": 2, "teamwide": False},
-            {"key": "boost_spd_+3_2g", "label": "Speed +3 (2 games)", "pts": 1.5, "stat": "speed", "amount": 3, "games": 2, "teamwide": False},
-            {"key": "team_all_+2_2g", "label": "Team All +2 (2 games)", "pts": 3.0, "stat": "all", "amount": 2, "games": 2, "teamwide": True},
-            {"key": "stamina_reset", "label": "Reset Fatigue (single)", "pts": 0.75, "stat": "stamina_reset", "amount": 100, "games": 0, "teamwide": False},
+    @staticmethod
+    def from_dict(d):
+        c = Card(
+            d["id"], d["name"], d["archetype"], d["attack_type"],
+            d["attack"], d["defense"], d["speed"], d["stamina"], d["special"],
+            d.get("base_cost", d["cost"]), d.get("age", 0), d.get("lifespan", 8),
+            d.get("retired", False)
+        )
+        c.cost = d.get("cost", c.base_cost)
+        c.awards = d.get("awards", [])
+        c.history = d.get("history", [])
+        return c
+
+
+class Team:
+    def __init__(self, name: str, logo: str, gm_personality: str):
+        self.name = name
+        self.logo = logo
+        self.gm_personality = gm_personality
+        self.wins = 0
+        self.losses = 0
+        self.streak = 0
+        self.roster: List[str] = []  # list of card ids
+        self.backup: Optional[str] = None
+        self.cost_spent = 0.0
+        self.shop_points_left = 20.0
+        self.boosts: List[Dict] = []
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "logo": self.logo,
+            "gm_personality": self.gm_personality,
+            "wins": self.wins,
+            "losses": self.losses,
+            "streak": self.streak,
+            "roster": self.roster,
+            "backup": self.backup,
+            "cost_spent": self.cost_spent,
+            "shop_points_left": self.shop_points_left,
+            "boosts": self.boosts,
+        }
+
+    @staticmethod
+    def from_dict(d):
+        t = Team(d["name"], d["logo"], d["gm_personality"])
+        t.wins = d.get("wins", 0)
+        t.losses = d.get("losses", 0)
+        t.streak = d.get("streak", 0)
+        t.roster = d.get("roster", [])
+        t.backup = d.get("backup", None)
+        t.cost_spent = d.get("cost_spent", 0.0)
+        t.shop_points_left = d.get("shop_points_left", 20.0)
+        t.boosts = d.get("boosts", [])
+        return t
+
+
+# ---------------------- League ----------------------
+class League:
+    def __init__(self):
+        self.season = 1
+        self.day = 1
+        self.max_team_cost = 100.0
+        self.teams: List[Team] = []
+        self.cards: Dict[str, Card] = {}
+        self.schedule: List[Tuple[int, int, int]] = []  # (day, home_idx, away_idx)
+        self.results: List[Dict] = []
+        self.transactions: List[str] = []
+        self.rivalries: Dict[Tuple[int, int], Dict] = {}
+        self.playoffs: Dict = {}
+        self.past_seasons: Dict[int, Dict] = {}
+        self.shop_catalog: List[Dict] = self.default_shop_catalog()
+        self.rng_seed = random.randint(1, 1_000_000)
+        random.seed(self.rng_seed)
+
+    # ---------------------- Save / Load ----------------------
+    def save(self, path: str = SAVE_FILE):
+        data = {
+            "season": self.season,
+            "day": self.day,
+            "max_team_cost": self.max_team_cost,
+            "teams": [t.to_dict() for t in self.teams],
+            "cards": {cid: c.to_dict() for cid, c in self.cards.items()},
+            "schedule": self.schedule,
+            "results": self.results,
+            "transactions": self.transactions,
+            "rivalries": self.rivalries,
+            "playoffs": self.playoffs,
+            "past_seasons": self.past_seasons,
+            "shop_catalog": self.shop_catalog,
+            "rng_seed": self.rng_seed,
+        }
+        with open(path, "w") as f:
+            json.dump(data, f)
+
+    @staticmethod
+    def load(path: str) -> Optional["League"]:
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            L = League()
+            L.season = data.get("season", 1)
+            L.day = data.get("day", 1)
+            L.max_team_cost = data.get("max_team_cost", 100.0)
+            L.teams = [Team.from_dict(td) for td in data.get("teams", [])]
+            L.cards = {cid: Card.from_dict(cd) for cid, cd in data.get("cards", {}).items()}
+            L.schedule = data.get("schedule", [])
+            L.results = data.get("results", [])
+            L.transactions = data.get("transactions", [])
+            L.rivalries = data.get("rivalries", {})
+            L.playoffs = data.get("playoffs", {})
+            L.past_seasons = data.get("past_seasons", {})
+            L.shop_catalog = data.get("shop_catalog", [])
+            L.rng_seed = data.get("rng_seed", random.randint(1, 1_000_000))
+            random.seed(L.rng_seed)
+            return L
+        except Exception as e:
+            print("Error loading league:", e)
+            return None
+
+    # ---------------------- Shop ----------------------
+    def default_shop_catalog(self):
+        return [
+            {"key": "atk_boost", "label": "+2 ATK for 3 games", "pts": 5, "stat": "attack", "amount": 2, "games": 3, "teamwide": False},
+            {"key": "def_boost", "label": "+2 DEF for 3 games", "pts": 5, "stat": "defense", "amount": 2, "games": 3, "teamwide": False},
+            {"key": "spd_boost", "label": "+1 SPD for 3 games", "pts": 5, "stat": "speed", "amount": 1, "games": 3, "teamwide": False},
+            {"key": "team_boost", "label": "+1 ATK to all starters for 2 games", "pts": 8, "stat": "attack", "amount": 1, "games": 2, "teamwide": True},
+            {"key": "stamina_reset", "label": "Reset fatigue for one card", "pts": 3, "stat": "stamina_reset", "amount": 0, "games": 0, "teamwide": False},
         ]
 
-        # Build world
-        self._generate_card_pool(min_cards=160, cap=170)
-        self._generate_teams(n_teams)
-        self.start_preseason()      # draft starters & backups, set chemistry, set budgets
-        self.generate_calendar()    # 20 weeks → 40 games per team
-        # Ready to play!
+    def purchase_boost(self, team_idx: int, item_key: str, target_card: Optional[str] = None):
+        team = self.teams[team_idx]
+        item = next((x for x in self.shop_catalog if x["key"] == item_key), None)
+        if not item:
+            return False, "Item not found."
+        if team.shop_points_left < item["pts"]:
+            return False, "Not enough shop points."
+        if not item["teamwide"] and not target_card:
+            return False, "Must specify a card."
+        team.shop_points_left -= item["pts"]
+        boost = {"key": item["key"], "stat": item["stat"], "amount": item["amount"], "teamwide": item["teamwide"], "games_left": item["games"]}
+        if target_card:
+            boost["target"] = target_card
+        team.boosts.append(boost)
+        self.transactions.append(f"{team.name} purchased {item['label']}")
+        return True, f"{team.name} purchased {item['label']}"
 
-    # ------------------------------------------------------------------
-    # Persistence
-    # ------------------------------------------------------------------
+    # ---------------------- Simulation ----------------------
+    def simulate_next_day(self):
+        games = [g for g in self.schedule if g[0] == self.day]
+        if not games:
+            self.day += 1
+            return []
 
-    @classmethod
-    def load(cls, path: str) -> Optional["League"]:
-        p = Path(path)
-        if not p.exists():
-            return None
-        data = json.loads(p.read_text())
-        L = cls.__new__(cls)  # bypass __init__
-        # Basic
-        L.rng_seed = data["rng_seed"]
-        random.seed(L.rng_seed)
-        L.season = data["season"]
-        L.day = data["day"]
-        L.max_team_cost = data["max_team_cost"]
-        L.schedule = [tuple(x) for x in data["schedule"]]
-        L.rivalries = {(int(k.split(",")[0]), int(k.split(",")[1])): v for k, v in data["rivalries"].items()}
-        L.transactions = data["transactions"]
-        L.results = data["results"]
-        L.playoffs = data["playoffs"]
-        L.past_seasons = {int(k): v for k, v in data["past_seasons"].items()}
-        L.records = data.get("records", {})
-        L.shop_catalog = data["shop_catalog"]
-
-        # Cards
-        L.cards = {}
-        for cid, cd in data["cards"].items():
-            L.cards[cid] = Card(**cd)
-
-        # Teams
-        L.teams = []
-        for td in data["teams"]:
-            T = Team(**td)
-            # Ensure tuple keys for chemistry
-            T.chemistry = {tuple(eval(k)) if isinstance(k,str) else tuple(k): v for k,v in T.chemistry.items()}
-            L.teams.append(T)
-
-        return L
-
-    def save(self, path: str = SAVE_FILE) -> None:
-        data = dict(
-            rng_seed=self.rng_seed,
-            season=self.season,
-            day=self.day,
-            max_team_cost=self.max_team_cost,
-            cards={cid: c.to_dict() for cid, c in self.cards.items()},
-            teams=[asdict(t) for t in self.teams],
-            schedule=self.schedule,
-            rivalries={f"{a},{b}": v for (a,b), v in self.rivalries.items()},
-            transactions=self.transactions,
-            results=self.results,
-            playoffs=self.playoffs,
-            past_seasons=self.past_seasons,
-            records=self.records,
-            shop_catalog=self.shop_catalog,
-        )
-        Path(path).write_text(json.dumps(data, indent=2))
-
-    # ------------------------------------------------------------------
-    # World generation
-    # ------------------------------------------------------------------
-
-    def _generate_card_pool(self, min_cards: int = 160, cap: int = 170) -> None:
-        """Create a card pool with names, stats, costs, and lifespans.
-
-        Ensures at least `min_cards` exist, and never above `cap` at once.
-        """
-        n_cards = random.randint(min_cards, min(min_cards+8, cap))
-        for i in range(n_cards):
-            cid = uid("C")
-            ar = random.choice(ARCHETYPES)
-            at = random.choice(ATTACK_TYPES)
-            atk = random.randint(50, 95)
-            dfn = random.randint(50, 95)
-            spd = random.randint(50, 95)
-            hsp = random.randint(40, 95)
-            typ = random.randint(40, 95)
-            syn = random.randint(40, 95)
-            # Total power = avg + synergy baseline + small randomness
-            raw_avg = (atk + dfn + spd + hsp + typ + syn) / 6.0
-            total = clamp(raw_avg + 0.25 * (syn - 50.0))
-            grade = "S" if total >= 90 else "A" if total >= 80 else "B" if total >= 70 else "C" if total >= 60 else "D"
-            base_cost = round(max(0.5, (total - 50) / 12.0), 2)  # 0.5–~4.2
-            cost = base_cost
-            life = random.randint(3, 8)
-            name = self._generate_card_name(i)
-            self.cards[cid] = Card(
-                id=cid, name=name, archetype=ar, attack_type=at,
-                attack=atk, defense=dfn, speed=spd, hit_speed=hsp,
-                atk_type_score=typ, synergy_score=syn,
-                total_power=int(round(total)), grade=grade,
-                cost=cost, base_cost=base_cost, age=0, lifespan=life,
-            )
-
-    def _generate_card_name(self, i: int) -> str:
-        # Semi-flavorful names
-        pool1 = ["Miner","Ice Wizard","Mega Knight","Giant Skeleton","Electro Spirit","Goblin Gang","Royal Ghost",
-                 "Dart Goblin","Battle Healer","Cannon Cart","Magic Archer","Inferno Dragon","Electro Wizard","Bandit",
-                 "Lumberjack","Skeleton King","Archer Queen","Golden Knight","Monk","Phoenix","Goblin Drill","Ram Rider"]
-        return random.choice(pool1) + f" #{i+1}"
-
-    def _generate_teams(self, n_teams: int) -> None:
-        names = [f"Team {chr(65+i)}" for i in range(n_teams)]
-        logos = ["🛡️","🐉","🦅","🦈","🦂","🐺","🦁","🐯","🐼","🦊","🐸","🐻","🦄","🐙","🐗","🦅","🐲","🐧","🦉","🦕","🐍","🦬","🦒","🦓","🦌","🦭","🐬","🦢","🦩","🦚"]
-        colors = ["#%06x" % random.randint(0, 0xFFFFFF) for _ in range(n_teams)]
-        gm_styles = ["Analyst","Trader","Culture","Risk-Taker","Balanced"]
-        for i in range(n_teams):
-            self.teams.append(Team(
-                id=uid("T"), name=names[i], logo=random.choice(logos), color=colors[i],
-                gm_personality=random.choice(gm_styles),
-                roster=[], backup=None, wins=0, losses=0, streak=0, cost_spent=0.0, shop_points_left=0.0,
-            ))
-
-    # ------------------------------------------------------------------
-    # Preseason: fantasy draft + backups + chemistry init
-    # ------------------------------------------------------------------
-
-    def start_preseason(self) -> None:
-        """Fantasy draft from scratch for all teams every season.
-
-        - Each team drafts 3 starters + 1 backup.
-        - Enforce salary cap 20 points.
-        - Initialize chemistry and shop points (remaining cap).
-        """
-        # reset per-team season flags
-        for T in self.teams:
-            T.wins = T.losses = 0
-            T.streak = 0
-            T.roster = []
-            T.backup = None
-            T.cost_spent = 0.0
-            T.shop_points_left = 0.0
-            T.boosts.clear()
-            T.trade_card_used = False
-            T.trade_pick_used = False
-            T.chemistry.clear()
-
-        # reset per-card season stats
-        for c in self.cards.values():
-            c.games_played = 0
-            c.contribution_sum = 0.0
-            c.avg_pct_contributed = 0.0
-            c.pick_rate = 0.0
-            c.fatigue = 100.0
-
-        # Wipe pick counts
-        pick_counts = {cid: 0 for cid in self.cards}
-
-        # Simple snake draft order
-        order = list(range(len(self.teams)))
-        rounds = 4  # 3 starters + 1 backup
-        forward = True
-        for r in range(rounds):
-            picks = order if forward else list(reversed(order))
-            for ti in picks:
-                self._draft_one_card(ti, pick_counts, is_backup=(r == 3))
-            forward = not forward
-
-        # Assign pick rates
-        total_picks = sum(pick_counts.values()) or 1
-        for cid, count in pick_counts.items():
-            self.cards[cid].pick_rate = round(100.0 * count / total_picks, 2)
-
-        # Set shop points from remaining cap
-        for T in self.teams:
-            T.shop_points_left = max(0.0, self.max_team_cost - T.cost_spent)
-
-        # Initialize starting chemistry for trios
-        for T in self.teams:
-            for i in range(len(T.roster)):
-                for j in range(i+1, len(T.roster)):
-                    a, b = T.roster[i], T.roster[j]
-                    base = 50.0 + synergy_bonus(self.cards[a].archetype, self.cards[b].archetype)
-                    T.chemistry[(a,b)] = clamp(base, 0, 100)
-
-    def _draft_one_card(self, ti: int, pick_counts: Dict[str, int], is_backup: bool=False) -> None:
-        T = self.teams[ti]
-        # Consider affordable cards, prefer higher total_power
-        candidates = [(cid, c) for cid, c in self.cards.items() if not c.retired and
-                      cid not in T.roster and cid != T.backup and (T.cost_spent + c.cost) <= self.max_team_cost]
-        if not candidates:
-            # allow over-cap last pick if needed (rare)
-            candidates = [(cid, c) for cid, c in self.cards.items() if not c.retired and cid not in T.roster and cid != T.backup]
-        candidates.sort(key=lambda x: (x[1].total_power, x[1].grade), reverse=True)
-        pick_cid = candidates[0][0] if candidates else None
-        if not pick_cid:
-            return
-        if is_backup and T.backup is None:
-            T.backup = pick_cid
-        else:
-            if len(T.roster) < 3:
-                T.roster.append(pick_cid)
-        T.cost_spent += self.cards[pick_cid].cost
-        pick_counts[pick_cid] += 1
-        self.transactions.append(f"Draft: {T.name} selected {self.cards[pick_cid].name} ({'Backup' if is_backup else 'Starter'})")
-
-    # ------------------------------------------------------------------
-    # Schedule
-    # ------------------------------------------------------------------
-
-    def generate_calendar(self) -> None:
-        """20 weeks, 40 games per team ⇒ (teams * 40)/2 total games.
-
-        We spread games across sequential 'days'. Rivalries increment when teams
-        meet; UI uses rivalries to show 🔥.
-        """
-        self.schedule = []
-        n = len(self.teams)
-        games_per_team = 40
-        # Track remaining games per team
-        remain = [games_per_team for _ in range(n)]
-        day = 1
-        # Simple pairing heuristic
-        while sum(remain) > 0:
-            used = set()
-            # attempt to schedule as many pairs as possible in a day
-            for a in range(n):
-                if a in used or remain[a] <= 0:
-                    continue
-                # find opponent with remaining games and not used
-                ops = [b for b in range(n) if b != a and b not in used and remain[b] > 0]
-                if not ops:
-                    continue
-                b = random.choice(ops)
-                home, away = (a, b) if random.random() < 0.5 else (b, a)
-                self.schedule.append((day, home, away))
-                used.add(a); used.add(b)
-                remain[a] -= 1; remain[b] -= 1
-                # rivalry bookkeeping
-                key = (min(a,b), max(a,b))
-                if key not in self.rivalries:
-                    self.rivalries[key] = {"games": 0, "a_wins": 0, "b_wins": 0}
-                self.rivalries[key]["games"] += 1
-            day += 1
-        # reset day to 1 for season start
-        self.day = 1
-
-    # ------------------------------------------------------------------
-    # Simulation
-    # ------------------------------------------------------------------
-
-    def season_complete(self) -> bool:
-        # All scheduled days completed when last day > max day in schedule
-        if not self.schedule:
-            return True
-        return self.day > max(d for d,_,_ in self.schedule)
-
-    def simulate_next_day(self) -> List[Dict[str, Any]]:
-        """Simulate all games whose day matches self.day.
-
-        Backup rule: If any starter fatigue < 25, auto-sub with backup for that slot.
-        Fatigue reduces by 8–15 for those who played; +12–20 recovery if they rested.
-        Contribution % is computed per-card within the team based on power formula.
-        """
-        todays = [x for x in self.schedule if x[0] == self.day]
-        recaps: List[Dict[str,Any]] = []
-        if not todays:
-            return recaps
-
-        for day, home_i, away_i in todays:
-            h_score, a_score, detail = self._simulate_game(home_i, away_i)
-            winner = self.teams[home_i].name if h_score > a_score else self.teams[away_i].name
-            self.results.append({
-                "day": day, "home": self.teams[home_i].name, "away": self.teams[away_i].name,
-                "home_score": h_score, "away_score": a_score, "winner": winner,
-                "comment": detail
-            })
-            recaps.append(self.results[-1])
+        recaps = []
+        for d, a, b in games:
+            home = self.teams[a]
+            away = self.teams[b]
+            home_score, away_score = self.simulate_match(home, away)
+            if home_score > away_score:
+                home.wins += 1
+                home.streak = max(1, home.streak + 1)
+                away.losses += 1
+                away.streak = min(-1, away.streak - 1)
+                winner = home.name
+            else:
+                away.wins += 1
+                away.streak = max(1, away.streak + 1)
+                home.losses += 1
+                home.streak = min(-1, home.streak - 1)
+                winner = away.name
+            recap = {"day": self.day, "home": home.name, "away": away.name, "home_score": home_score, "away_score": away_score, "winner": winner, "comment": "GGs!"}
+            self.results.append(recap)
+            recaps.append(recap)
         self.day += 1
         return recaps
 
-    def _effective_card_power(self, card: Card, boosts: List[Dict[str, Any]]) -> float:
-        atk = card.attack
-        dfn = card.defense
-        spd = card.speed
-        hsp = card.hit_speed
-        typ = card.atk_type_score
-        syn = card.synergy_score
-        # apply active boosts
-        for b in list(boosts):
-            if b.get("games_left", 0) == 0 and b["stat"] != "stamina_reset":
-                continue
-            if b["teamwide"] or b.get("target") == card.id:
-                if b["stat"] == "attack":
-                    atk += b["amount"]
-                elif b["stat"] == "defense":
-                    dfn += b["amount"]
-                elif b["stat"] == "speed":
-                    spd += b["amount"]
-                elif b["stat"] == "all":
-                    atk += b["amount"]; dfn += b["amount"]; spd += b["amount"]
-        # fatigue penalty
-        fatigue_factor = 0.5 + 0.5 * (card.fatigue/100.0)  # 0.5–1.0
-        base = (atk*0.28 + dfn*0.24 + spd*0.22 + hsp*0.10 + typ*0.06 + syn*0.10)
-        return base * fatigue_factor
-
-    def _chemistry_pair_bonus(self, T: Team) -> float:
-        # average chemistry over pairs (0–100 → 0.95–1.05 multiplier)
-        if len(T.roster) < 3:
-            return 1.0
-        pairs = []
-        for i in range(3):
-            for j in range(i+1, 3):
-                key = (T.roster[i], T.roster[j])
-                val = T.chemistry.get(key, 50.0)
-                pairs.append(val)
-        avg = statistics.mean(pairs) if pairs else 50.0
-        return 0.95 + 0.001 * (avg - 50.0)  # 50 → 0.95; 100 → 1.0
-
-    def _maybe_use_backup(self, T: Team) -> Tuple[List[str], List[str]]:
-        # Returns (active_ids, benched_ids) for starters w/ backup subs if fatigue < 25
-        active = T.roster.copy()
-        benched = []
-        if T.backup:
-            for i, cid in enumerate(T.roster):
-                if self.cards[cid].fatigue < 25.0:
-                    active[i] = T.backup
-                    benched.append(cid)
-        return active, benched
-
-    def _simulate_game(self, home_i: int, away_i: int) -> Tuple[int, int, str]:
-        H = self.teams[home_i]
-        A = self.teams[away_i]
-
-        # apply backup rule
-        h_active, h_bench = self._maybe_use_backup(H)
-        a_active, a_bench = self._maybe_use_backup(A)
-
-        # compute per-card powers
-        def team_power(T: Team, active_ids: List[str]) -> Tuple[float, Dict[str,float]]:
-            pmap = {}
-            for cid in active_ids:
-                c = self.cards[cid]
-                pmap[cid] = self._effective_card_power(c, T.boosts)
-            # synergy multiplier based on archetype pairings
-            mult = self._chemistry_pair_bonus(T)
-            total = sum(pmap.values()) * mult
-            return total, pmap
-
-        home_total, h_map = team_power(H, h_active)
-        away_total, a_map = team_power(A, a_active)
-
-        # random noise + tiny home advantage
-        home_total *= 1.03
-        noise_h = random.uniform(0.95, 1.05)
-        noise_a = random.uniform(0.95, 1.05)
-        h_score = int(round(home_total * noise_h / 10.0))
-        a_score = int(round(away_total * noise_a / 10.0))
-        if h_score == a_score:
-            # tiebreak
-            if random.random() < 0.5:
-                h_score += 1
-            else:
-                a_score += 1
-
-        # update W/L records
-        if h_score > a_score:
-            H.wins += 1; A.losses += 1
-            H.streak = H.streak + 1 if H.streak >= 0 else 1
-            A.streak = A.streak - 1 if A.streak <= 0 else -1
-            # rivalry bookkeeping
-            key = (min(home_i, away_i), max(home_i, away_i))
-            if home_i < away_i:
-                self.rivalries[key]["a_wins"] += 1
-            else:
-                self.rivalries[key]["b_wins"] += 1
-        else:
-            A.wins += 1; H.losses += 1
-            A.streak = A.streak + 1 if A.streak >= 0 else 1
-            H.streak = H.streak - 1 if H.streak <= 0 else -1
-            key = (min(home_i, away_i), max(home_i, away_i))
-            if away_i < home_i:
-                self.rivalries[key]["a_wins"] += 1
-            else:
-                self.rivalries[key]["b_wins"] += 1
-
-        # contributions -> normalize to %
-        def apply_contrib(T: Team, active_ids: List[str], pmap: Dict[str,float], bench_ids: List[str]):
-            total = sum(pmap.values()) or 1.0
-            for cid, val in pmap.items():
-                c = self.cards[cid]
-                c.games_played += 1
-                pct = 100.0 * (val / total)
-                c.contribution_sum += pct
-            # benchers recover fatigue more
-            for cid in bench_ids:
-                self.cards[cid].fatigue = clamp(self.cards[cid].fatigue + random.uniform(10, 18))
-
-        apply_contrib(H, h_active, h_map, h_bench)
-        apply_contrib(A, a_active, a_map, a_bench)
-
-        # fatigue decay for players who played
-        def decay_fatigue(active_ids: List[str]):
-            for cid in active_ids:
-                c = self.cards[cid]
-                c.fatigue = clamp(c.fatigue - random.uniform(8, 15))
-
-        decay_fatigue(h_active)
-        decay_fatigue(a_active)
-
-        # decrement boost durations
-        def tick_boosts(T: Team):
-            nxt = []
-            for b in T.boosts:
-                if b["stat"] == "stamina_reset":
-                    continue
-                g = b.get("games_left", 0)
-                if g > 1:
-                    b["games_left"] = g - 1
-                    nxt.append(b)
-            T.boosts = nxt
-
-        tick_boosts(H); tick_boosts(A)
-
-        detail = f"{self.teams[home_i].name} vs {self.teams[away_i].name} — active subs: {len(h_bench)+len(a_bench)}"
-        return h_score, a_score, detail
-
-    # ------------------------------------------------------------------
-    # Standings / Tables
-    # ------------------------------------------------------------------
-
-    def standings_table(self) -> List[Dict[str, Any]]:
-        tbl = []
-        for i, T in enumerate(self.teams):
-            tbl.append({"Rank": i+1, "Team": T.name, "W": T.wins, "L": T.losses, "Streak": T.streak})
-        tbl.sort(key=lambda x: (x["W"], -x["L"]), reverse=True)
-        for i, r in enumerate(tbl):
-            r["Rank"] = i+1
-        return tbl
-
-    # ------------------------------------------------------------------
-    # Shop
-    # ------------------------------------------------------------------
-
-    def purchase_boost(self, team_idx: int, key: str, target_card: Optional[str]=None) -> Tuple[bool, str]:
-        T = self.teams[team_idx]
-        item = next((x for x in self.shop_catalog if x["key"] == key), None)
-        if not item:
-            return False, "Item not found."
-        if T.shop_points_left < item["pts"]:
-            return False, "Not enough shop points."
-        if not item["teamwide"] and item["stat"] != "stamina_reset" and not target_card:
-            return False, "This item needs a target card."
-        entry = dict(item)
-        entry["games_left"] = item["games"]
-        if not item["teamwide"]:
-            entry["target"] = target_card
-        # stamina reset is immediate
-        if item["stat"] == "stamina_reset" and target_card:
-            self.cards[target_card].fatigue = 100.0
-            T.shop_points_left -= item["pts"]
-            self.transactions.append(f"Shop: {T.name} reset fatigue for {self.cards[target_card].name}")
-            return True, "Fatigue reset applied."
-        T.boosts.append(entry)
-        T.shop_points_left -= item["pts"]
-        self.transactions.append(f"Shop: {T.name} purchased {item['label']}")
-        return True, "Boost added."
-
-    # ------------------------------------------------------------------
-    # Trades
-    # ------------------------------------------------------------------
-
-    def trade_finder_offers(self, your_idx: int, your_card: str) -> List[Dict[str, Any]]:
-        offers = []
-        yourT = self.teams[your_idx]
-        yc = self.cards[your_card]
-        for ti, T in enumerate(self.teams):
-            if ti == your_idx:
-                continue
-            for cid in T.roster + ([T.backup] if T.backup else []):
-                if not cid:
+    def simulate_match(self, home: Team, away: Team) -> Tuple[int, int]:
+        def team_strength(team: Team):
+            strength = 0
+            for cid in team.roster:
+                if cid not in self.cards:
                     continue
                 c = self.cards[cid]
-                # simple heuristic: offer if total_power within ±8 and cap remains valid
-                if abs(c.total_power - yc.total_power) <= 8:
-                    new_cost_you = yourT.cost_spent - yc.cost + c.cost
-                    new_cost_them = T.cost_spent - c.cost + yc.cost
-                    if new_cost_you <= self.max_team_cost and new_cost_them <= self.max_team_cost:
-                        offers.append({
-                            "team_idx": ti, "team_name": T.name,
-                            "their_card": cid, "their_card_name": c.name, "their_cost": c.cost
-                        })
-        return offers
+                strength += c.attack + c.defense + c.speed + c.stamina + c.special
+            # apply boosts
+            for b in team.boosts:
+                if b.get("games_left", 0) > 0:
+                    if b["teamwide"]:
+                        strength += b["amount"] * len(team.roster)
+                    else:
+                        strength += b["amount"]
+                    b["games_left"] -= 1
+            return strength
+        return team_strength(home) + random.randint(0, 10), team_strength(away) + random.randint(0, 10)
 
-    def execute_trade(self, your_idx: int, your_card: str, other_idx: int, their_card: str) -> Tuple[bool, str]:
-        A = self.teams[your_idx]; B = self.teams[other_idx]
-        if A.trade_card_used:
-            return False, "You have already used your card-trade slot this season."
-        # swap if appears in roster or backup
-        def swap(T: Team, out_id: str, in_id: str):
-            if out_id in T.roster:
-                i = T.roster.index(out_id)
-                T.roster[i] = in_id
-            elif T.backup == out_id:
-                T.backup = in_id
+    def season_complete(self):
+        return all(g[0] < self.day for g in self.schedule)
 
-        if your_card not in A.roster + ([A.backup] if A.backup else []):
-            return False, "Your card not on your team."
-        if their_card not in B.roster + ([B.backup] if B.backup else []):
-            return False, "Other card not on their team."
+    # ---------------------- Playoffs ----------------------
+    def start_playoffs(self):
+        standings = sorted(self.teams, key=lambda t: t.wins, reverse=True)
+        top16 = standings[:16]
+        self.playoffs = {"bracket": [(i, i+1) for i in range(0, len(top16), 2)], "results": []}
 
-        yc = self.cards[your_card]; oc = self.cards[their_card]
-        new_cost_A = A.cost_spent - yc.cost + oc.cost
-        new_cost_B = B.cost_spent - oc.cost + yc.cost
-        if new_cost_A > self.max_team_cost or new_cost_B > self.max_team_cost:
-            return False, "Trade violates salary cap."
+    def simulate_playoffs_to_champion(self):
+        if not self.playoffs:
+            return None
+        bracket = self.playoffs.get("bracket", [])
+        while len(bracket) > 1:
+            next_round = []
+            for a, b in bracket:
+                home, away = self.teams[a], self.teams[b]
+                hs, ascore = self.simulate_match(home, away)
+                winner = a if hs > ascore else b
+                next_round.append((winner,))
+                self.playoffs["results"].append({"A": home.name, "B": away.name, "Score": f"{hs}-{ascore}", "Winner": self.teams[winner].name})
+            bracket = [(next_round[i][0], next_round[i+1][0]) for i in range(0, len(next_round), 2) if i+1 < len(next_round)]
+        champion_idx = bracket[0][0] if bracket else None
+        if champion_idx is not None:
+            self.playoffs["champion"] = self.teams[champion_idx].name
+        return champion_idx
 
-        swap(A, your_card, their_card)
-        swap(B, their_card, your_card)
-        A.cost_spent = new_cost_A; B.cost_spent = new_cost_B
-        A.trade_card_used = True
-        self.transactions.append(f"Trade: {A.name} traded {yc.name} ⇄ {oc.name} with {B.name}")
-        return True, "Trade completed."
-
-    # ------------------------------------------------------------------
-    # Playoffs
-    # ------------------------------------------------------------------
-
-    def start_playoffs(self) -> None:
-        """Seed top 16 by record. Series lengths: 3/5/5/7. Bracket pairs are (1,16),(2,15),..."""
-        tbl = self.standings_table()
-        order = [next(i for i,T in enumerate(self.teams) if T.name == row["Team"]) for row in tbl]
-        seeds = order[:16]
-        pairs = []
-        for i in range(8):
-            pairs.append((seeds[i], seeds[15-i]))
-        self.playoffs = {"bracket": pairs, "results": [], "champion": None}
-
-    def _simulate_series(self, a: int, b: int, best_of: int) -> int:
-        wins_needed = best_of//2 + 1
-        aw = bw = 0
-        while aw < wins_needed and bw < wins_needed:
-            hs, as_, _ = self._simulate_game(a, b)
-            if hs > as_:
-                aw += 1
-            else:
-                bw += 1
-        return a if aw > bw else b
-
-    def simulate_playoffs_to_champion(self) -> int:
-        if not self.playoffs or not self.playoffs.get("bracket"):
-            self.start_playoffs()
-        pairs = self.playoffs["bracket"]
-        rounds = [3,5,5,7]
-        winners = []
-        rnd_results = []
-        current = pairs
-        for rnd, bo in enumerate(rounds, start=1):
-            winners = []
-            for a,b in current:
-                w = self._simulate_series(a,b,bo)
-                winners.append(w)
-                rnd_results.append({"round": rnd, "A": self.teams[a].name, "B": self.teams[b].name, "best_of": bo, "winner": self.teams[w].name})
-            # next round pairing
-            current = [(winners[i], winners[i+1]) for i in range(0, len(winners), 2)]
-
-        champ = winners[0]
-        self.playoffs["champion"] = self.teams[champ].name
-        self.playoffs["results"] = rnd_results
-
-        # increment GM title
-        self.teams[champ].career_titles += 1
-        return champ
-
-    # ------------------------------------------------------------------
-    # Awards & Patches & Retirements
-    # ------------------------------------------------------------------
-
-    def calculate_awards(self, champion_idx: int) -> Dict[str, Any]:
-        """Compute MVP, DPOY, 6MOY, ROTY, Finals MVP (simple proxy)."""
-        # Calculate per-card averages
-        for c in self.cards.values():
-            c.avg_pct_contributed = (c.contribution_sum / c.games_played) if c.games_played else 0.0
-
-        # MVP: highest avg_pct_contributed (minimum games filter)
-        candidates = [c for c in self.cards.values() if c.games_played >= 10 and not c.retired]
-        mvp = max(candidates, key=lambda c: c.avg_pct_contributed, default=None)
-
-        # DPOY: composite of DEF + (contribution weighted by DEF share)
-        def d_def_score(c: Card) -> float:
-            base = c.defense
-            return base * (0.6 + 0.4 * (c.avg_pct_contributed/100.0))
-
-        dpoy = max(candidates, key=d_def_score, default=None)
-
-        # Sixth Man: best backup contribution (played many games as backup)
-        # Heuristic: card whose fatigue stayed high (not over-used) but high contribution; or those flagged as backups on many teams
-        sixth = max(candidates, key=lambda c: (c.avg_pct_contributed * (1.0 if c.pick_rate < 1.5 else 0.9)), default=None)
-
-        # Rookie: lowest age (0) with strong avg contribution
-        rookies = [c for c in self.cards.values() if c.age == 0 and not c.retired]
-        roty = max(rookies, key=lambda c: c.avg_pct_contributed, default=None)
-
-        # Finals MVP: pick among champion team's roster with highest contribution average
-        champ_team = self.teams[champion_idx]
-        finals_pool = [self.cards[cid] for cid in champ_team.roster if cid in self.cards]
-        finals_mvp = max(finals_pool, key=lambda c: c.avg_pct_contributed, default=(finals_pool[0] if finals_pool else None))
-
-        awards = {
-            "MVP": mvp.name if mvp else None,
-            "DPOY": dpoy.name if dpoy else None,
-            "Sixth Man": sixth.name if sixth else None,
-            "ROTY": roty.name if roty else None,
-            "Finals MVP": finals_mvp.name if finals_mvp else None,
-        }
-        # Attach to cards
-        for k, name in awards.items():
-            if not name:
-                continue
-            card = next((c for c in self.cards.values() if c.name == name), None)
-            if card:
-                card.awards.append(f"{k} S{self.season}")
-
+    # ---------------------- Awards, Patch, Archive ----------------------
+    def calculate_awards(self, champion_idx: int):
+        awards = {"MVP": self.teams[champion_idx].roster[0] if self.teams[champion_idx].roster else None}
+        if awards["MVP"]:
+            self.cards[awards["MVP"].strip()].awards.append("MVP")
         return awards
 
-    def adjust_costs(self, awards: Dict[str, Any]) -> None:
-        # Small adjustments: MVP +0.5, DPOY +0.3, Finals MVP +0.3, ROTY +0.2, Sixth +0.2
-        bumps = {"MVP": 0.5, "DPOY": 0.3, "Finals MVP": 0.3, "ROTY": 0.2, "Sixth Man": 0.2}
-        for k, nm in awards.items():
-            if not nm:
-                continue
-            for c in self.cards.values():
-                if c.name == nm:
-                    c.cost = round(c.cost + bumps[k], 2)
+    def adjust_costs(self, awards: Dict):
+        for cid, c in self.cards.items():
+            if "MVP" in c.awards:
+                c.cost += 2
+            else:
+                c.cost = max(1, c.cost - 0.5)
 
-    def apply_patch(self) -> Dict[str, Any]:
-        """Patch notes: random buffs/nerfs; retirements may be tagged as 'patch-related' later."""
-        changes = []
-        for c in random.sample(list(self.cards.values()), k=min(20, len(self.cards))):
-            delta = random.randint(-4, 4)
-            if delta == 0:
-                continue
-            # choose stat
-            stat = random.choice(["attack","defense","speed","hit_speed","atk_type_score","synergy_score"])
-            old = getattr(c, stat)
-            new = int(clamp(old + delta, 30, 99))
-            setattr(c, stat, new)
-            # recompute total/grade
-            raw_avg = (c.attack + c.defense + c.speed + c.hit_speed + c.atk_type_score + c.synergy_score)/6.0
-            c.total_power = int(round(clamp(raw_avg + 0.25*(c.synergy_score-50))))
-            c.grade = "S" if c.total_power >= 90 else "A" if c.total_power >= 80 else "B" if c.total_power >= 70 else "C" if c.total_power >= 60 else "D"
-            changes.append({"card": c.name, "stat": stat, "delta": delta})
-        patch = {"season": self.season, "nickname": random.choice(["Tank Nerf Patch","Speed Era Begins","Synergy Shuffle","Meta Mixer","Balance Tuning"]), "changes": changes}
-        self.transactions.append(f"Patch {patch['nickname']} applied with {len(changes)} changes.")
+    def apply_patch(self):
+        patch = {"nerfs": [], "buffs": []}
+        for cid, c in self.cards.items():
+            if random.random() < 0.05:
+                c.attack -= 1
+                patch["nerfs"].append(c.name)
+            elif random.random() < 0.05:
+                c.attack += 1
+                patch["buffs"].append(c.name)
         return patch
 
-    def retire_and_add_rookies(self) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-        """Retire 3 cards (or those exceeding lifespan) and add 4 rookies; keep pool <= 170."""
+    def retire_and_add_rookies(self):
         retired = []
-        # forced retirements by age
-        force_ids = [cid for cid, c in self.cards.items() if (c.age >= c.lifespan or c.retired)]
-        # choose additional retirements
-        pool_ids = [cid for cid in self.cards if cid not in force_ids]
-        rand_ids = random.sample(pool_ids, k=min(3, len(pool_ids)))
-        for cid in set(force_ids + rand_ids):
-            c = self.cards[cid]
-            c.retired = True
-            retired.append({"card": c.name, "reason": "Patch-related" if random.random() < 0.2 else "Age/Lifespan"})
-        # age everyone else
-        for c in self.cards.values():
-            if not c.retired:
-                c.age += 1
-        # rookies
         rookies = []
-        to_add = 4
-        # keep pool size under cap by deleting fully retired + not on rosters
-        active_ids = {cid for T in self.teams for cid in (T.roster + ([T.backup] if T.backup else []))}
-        if len(self.cards) + to_add > 170:
-            # prune retired non-rostered cards
-            for cid in list(self.cards.keys()):
-                if self.cards[cid].retired and cid not in active_ids:
-                    del self.cards[cid]
-        for i in range(to_add):
-            cid = uid("C")
-            ar = random.choice(ARCHETYPES)
-            at = random.choice(ATTACK_TYPES)
-            atk = random.randint(55, 92)
-            dfn = random.randint(55, 92)
-            spd = random.randint(55, 92)
-            hsp = random.randint(45, 92)
-            typ = random.randint(45, 92)
-            syn = random.randint(45, 92)
-            raw_avg = (atk + dfn + spd + hsp + typ + syn) / 6.0
-            total = clamp(raw_avg + 0.25 * (syn - 50.0))
-            grade = "S" if total >= 90 else "A" if total >= 80 else "B" if total >= 70 else "C" if total >= 60 else "D"
-            base_cost = round(max(0.5, (total - 50) / 12.0), 2)
-            cost = base_cost
-            life = random.randint(3, 8)
-            name = "Rookie " + self._generate_card_name(random.randint(1000, 9999))
-            self.cards[cid] = Card(
-                id=cid, name=name, archetype=ar, attack_type=at,
-                attack=atk, defense=dfn, speed=spd, hit_speed=hsp,
-                atk_type_score=typ, synergy_score=syn,
-                total_power=int(round(total)), grade=grade,
-                cost=cost, base_cost=base_cost, age=0, lifespan=life,
-            )
-            rookies.append({"card": name, "badge": "NEW"})
+        for cid, c in list(self.cards.items()):
+            c.age += 1
+            if c.age >= c.lifespan:
+                c.retired = True
+                retired.append(c.name)
+        for i in range(5):
+            cid = f"R{i}_{self.season}"
+            rookie = Card(cid, f"Rookie {i}", "NewGen", "Melee", 5, 5, 5, 5, 5, 5.0)
+            self.cards[cid] = rookie
+            rookies.append(rookie.name)
         return retired, rookies
 
-    # ------------------------------------------------------------------
-    # Archive
-    # ------------------------------------------------------------------
-
-    def archive_season(self, awards: Dict[str, Any], patch: Dict[str, Any],
-                       retired: List[Dict[str, Any]], rookies: List[Dict[str, Any]], champion_idx: int) -> None:
-        # standings snapshot
-        standings = self.standings_table()
-        # store season data
+    def archive_season(self, awards, patch, retired, rookies, champ_idx):
         self.past_seasons[self.season] = {
-            "standings": standings,
+            "standings": self.standings_table(),
             "awards": awards,
-            "playoffs": {
-                "champion": self.teams[champion_idx].name,
-                "rounds": self.playoffs.get("results", []),
-            },
+            "patch_notes": patch,
             "retirements": retired,
             "rookies": rookies,
-            "transactions": list(self.transactions),
-            "patch_notes": patch,
+            "playoffs": self.playoffs,
+            "transactions": self.transactions,
         }
-        # HOF probability update
-        self._update_hof_probabilities()
-        # reset in-season logs (kept in archive)
-        self.transactions.clear()
-        self.results.clear()
-        self.playoffs = {}
 
-    # ------------------------------------------------------------------
-    # HOF Tracker
-    # ------------------------------------------------------------------
+    # ---------------------- Standings ----------------------
+    def standings_table(self):
+        return [{"Team": t.name, "W": t.wins, "L": t.losses, "Streak": t.streak} for t in self.teams]
 
-    def _update_hof_probabilities(self) -> None:
-        """Compute a rolling 'HOF probability' for each card based on awards,
-        contribution, and longevity. Weighted awards: MVP > Finals MVP > DPOY > ROTY/6MOY.
-        """
-        for c in self.cards.values():
-            score = 0.0
-            # awards
-            for a in c.awards:
-                if "MVP" in a and "Finals" not in a:
-                    score += 10
-                elif "Finals MVP" in a:
-                    score += 6
-                elif "DPOY" in a:
-                    score += 4
-                elif "ROTY" in a or "Sixth Man" in a:
-                    score += 2
-            # contribution
-            score += min(10.0, c.avg_pct_contributed / 10.0)  # up to +10
-            # longevity
-            score += min(8.0, c.age * 0.75)
-            # grade / total
-            score += (c.total_power - 60) * 0.2  # S-tier tends to rise
-            c.hof_prob = clamp(score, 0, 100)
+    # ---------------------- Utilities ----------------------
+    def reset_new_league(self):
+        self.__init__()
+        self.start_preseason()
 
-    # ------------------------------------------------------------------
-    # Utilities
-    # ------------------------------------------------------------------
-
-    def run_full_season_if_needed(self) -> None:
-        if not self.season_complete():
-            while not self.season_complete():
-                self.simulate_next_day()
+    def run_full_season_if_needed(self):
+        while not self.season_complete():
+            self.simulate_next_day()
         champ_idx = self.simulate_playoffs_to_champion()
         awards = self.calculate_awards(champ_idx)
         self.adjust_costs(awards)
@@ -994,11 +342,834 @@ class League:
         retired, rookies = self.retire_and_add_rookies()
         self.archive_season(awards, patch, retired, rookies, champ_idx)
         self.season += 1
-        self.generate_calendar()
+        self.day = 1
         self.start_preseason()
-        self.save()
 
-    def reset_new_league(self) -> None:
+    def generate_calendar(self):
+        self.schedule = []
+        days = 30
+        team_indices = list(range(len(self.teams)))
+        for d in range(1, days+1):
+            a, b = random.sample(team_indices, 2)
+            self.schedule.append((d, a, b))
+
+    def start_preseason(self):
+        if not self.teams:
+            for i in range(30):
+                self.teams
+import json
+import os
+import random
+import math
+from typing import List, Dict, Optional, Tuple
+
+SAVE_FILE = "league_save.json"
+
+# ==========================================================
+# Data Models
+# ==========================================================
+class Card:
+    """Represents a single card in the league.
+
+    Attributes used by the UI:
+      - id, name, archetype, attack_type
+      - attack, defense, speed, stamina, special  (all /100)
+      - cost, base_cost
+      - age, lifespan, retired
+      - awards: List[str]
+      - history: season-by-season snapshots (free-form dicts)
+    """
+    def __init__(
+        self,
+        cid: str,
+        name: str,
+        archetype: str,
+        attack_type: str,
+        attack: int,
+        defense: int,
+        speed: int,
+        stamina: int,
+        special: int,
+        cost: float,
+        age: int = 0,
+        lifespan: int = 6,
+        retired: bool = False,
+    ):
+        self.id = cid
+        self.name = name
+        self.archetype = archetype
+        self.attack_type = attack_type
+        self.attack = int(attack)
+        self.defense = int(defense)
+        self.speed = int(speed)
+        self.stamina = int(stamina)
+        self.special = int(special)
+        self.base_cost = float(cost)
+        self.cost = float(cost)
+        self.age = int(age)
+        self.lifespan = int(lifespan)
+        self.retired = bool(retired)
+        self.awards: List[str] = []
+        self.history: List[Dict] = []
+
+    # ---- Serialization ----
+    def to_dict(self) -> Dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "archetype": self.archetype,
+            "attack_type": self.attack_type,
+            "attack": self.attack,
+            "defense": self.defense,
+            "speed": self.speed,
+            "stamina": self.stamina,
+            "special": self.special,
+            "base_cost": self.base_cost,
+            "cost": self.cost,
+            "age": self.age,
+            "lifespan": self.lifespan,
+            "retired": self.retired,
+            "awards": list(self.awards),
+            "history": list(self.history),
+        }
+
+    @staticmethod
+    def from_dict(d: Dict) -> "Card":
+        c = Card(
+            d["id"],
+            d["name"],
+            d.get("archetype", "Hybrid"),
+            d.get("attack_type", "Melee"),
+            int(d.get("attack", 50)),
+            int(d.get("defense", 50)),
+            int(d.get("speed", 50)),
+            int(d.get("stamina", 50)),
+            int(d.get("special", 50)),
+            float(d.get("base_cost", d.get("cost", 5.0))),
+            int(d.get("age", 0)),
+            int(d.get("lifespan", 6)),
+            bool(d.get("retired", False)),
+        )
+        c.cost = float(d.get("cost", c.base_cost))
+        c.awards = list(d.get("awards", []))
+        c.history = list(d.get("history", []))
+        return c
+
+
+class Team:
+    """Represents a fantasy team run by a GM."""
+
+    def __init__(self, name: str, logo: str, gm_personality: str):
+        self.name = name
+        self.logo = logo
+        self.gm_personality = gm_personality
+        self.wins = 0
+        self.losses = 0
+        self.streak = 0  # +n = win streak, -n = losing streak
+        self.roster: List[str] = []       # 3 starters (card ids)
+        self.backup: Optional[str] = None # 1 backup (card id)
+        self.cost_spent = 0.0
+        self.shop_points_left = 0.0       # set at end of draft = leftover cap
+        self.boosts: List[Dict] = []      # active boosts purchased in shop
+        self.trades_used = 0              # count card trades used this season
+
+    # ---- Serialization ----
+    def to_dict(self) -> Dict:
+        return {
+            "name": self.name,
+            "logo": self.logo,
+            "gm_personality": self.gm_personality,
+            "wins": self.wins,
+            "losses": self.losses,
+            "streak": self.streak,
+            "roster": list(self.roster),
+            "backup": self.backup,
+            "cost_spent": self.cost_spent,
+            "shop_points_left": self.shop_points_left,
+            "boosts": list(self.boosts),
+            "trades_used": self.trades_used,
+        }
+
+    @staticmethod
+    def from_dict(d: Dict) -> "Team":
+        t = Team(d["name"], d.get("logo", "🏰"), d.get("gm_personality", "balanced"))
+        t.wins = int(d.get("wins", 0))
+        t.losses = int(d.get("losses", 0))
+        t.streak = int(d.get("streak", 0))
+        t.roster = list(d.get("roster", []))
+        t.backup = d.get("backup")
+        t.cost_spent = float(d.get("cost_spent", 0.0))
+        t.shop_points_left = float(d.get("shop_points_left", 0.0))
+        t.boosts = list(d.get("boosts", []))
+        t.trades_used = int(d.get("trades_used", 0))
+        return t
+
+
+# ==========================================================
+# League Engine
+# ==========================================================
+class League:
+    """Core league simulation used by the Streamlit UI.
+
+    API relied on by the current app.py (keep names stable):
+      - attributes: season, day, max_team_cost, teams, cards, schedule,
+                    results, transactions, rivalries, playoffs,
+                    past_seasons, shop_catalog
+      - methods: save, load, start_preseason, generate_calendar,
+                 simulate_next_day, season_complete,
+                 start_playoffs, simulate_playoffs_to_champion,
+                 calculate_awards, adjust_costs, apply_patch,
+                 retire_and_add_rookies, archive_season,
+                 standings_table, purchase_boost,
+                 trade_finder_offers, execute_trade,
+                 run_full_season_if_needed, reset_new_league
+    """
+
+    # ---------------------- Init ----------------------
+    def __init__(self):
+        self.season: int = 1
+        self.day: int = 1
+        # Salary-cap spec from planning: 20 points max
+        self.max_team_cost: float = 20.0
+
+        self.teams: List[Team] = []
+        self.cards: Dict[str, Card] = {}
+        self.schedule: List[Tuple[int, int, int]] = []  # (day, home_idx, away_idx)
+        self.results: List[Dict] = []
+        self.transactions: List[str] = []
+        self.rivalries: Dict[Tuple[int, int], Dict] = {}
+        self.playoffs: Dict = {}
+        self.past_seasons: Dict[int, Dict] = {}
+
+        self.shop_catalog: List[Dict] = self._default_shop_catalog()
+
+        self.rng_seed: int = random.randint(1, 1_000_000)
         random.seed(self.rng_seed)
-        self.__init__(n_teams=len(self.teams), rng_seed=self.rng_seed)
-        self.save()
+
+    # ---------------------- Save / Load ----------------------
+    def save(self, path: str = SAVE_FILE) -> None:
+        data = {
+            "season": self.season,
+            "day": self.day,
+            "max_team_cost": self.max_team_cost,
+            "teams": [t.to_dict() for t in self.teams],
+            "cards": {cid: c.to_dict() for cid, c in self.cards.items()},
+            "schedule": list(self.schedule),
+            "results": list(self.results),
+            "transactions": list(self.transactions),
+            "rivalries": {f"{a}-{b}": v for (a, b), v in self.rivalries.items()},
+            "playoffs": self.playoffs,
+            "past_seasons": self.past_seasons,
+            "shop_catalog": self.shop_catalog,
+            "rng_seed": self.rng_seed,
+        }
+        with open(path, "w") as f:
+            json.dump(data, f)
+
+    @staticmethod
+    def load(path: str) -> Optional["League"]:
+        """Load league from JSON file, or return None if missing/corrupt.
+        This is tolerant to older save formats (uses .get defaults).
+        """
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            L = League()
+            L.season = int(data.get("season", 1))
+            L.day = int(data.get("day", 1))
+            L.max_team_cost = float(data.get("max_team_cost", 20.0))
+            L.teams = [Team.from_dict(td) for td in data.get("teams", [])]
+            L.cards = {cid: Card.from_dict(cd) for cid, cd in data.get("cards", {}).items()}
+            L.schedule = [tuple(x) for x in data.get("schedule", [])]
+            L.results = list(data.get("results", []))
+            L.transactions = list(data.get("transactions", []))
+            # Rivalries were stored with "a-b" keys for json-friendly format.
+            riv = {}
+            for k, v in data.get("rivalries", {}).items():
+                try:
+                    a, b = k.split("-")
+                    riv[(int(a), int(b))] = v
+                except Exception:
+                    continue
+            L.rivalries = riv
+            L.playoffs = data.get("playoffs", {})
+            L.past_seasons = data.get("past_seasons", {})
+            L.shop_catalog = data.get("shop_catalog", L._default_shop_catalog())
+            L.rng_seed = int(data.get("rng_seed", random.randint(1, 1_000_000)))
+            random.seed(L.rng_seed)
+            return L
+        except Exception as e:
+            print("Error loading league:", e)
+            return None
+
+    # ---------------------- Shop ----------------------
+    def _default_shop_catalog(self) -> List[Dict]:
+        # Costs expressed in leftover cap points (shop_points_left)
+        return [
+            {"key": "atk_boost", "label": "+2 ATK (3 games)", "pts": 4, "stat": "attack", "amount": 2, "games": 3, "teamwide": False},
+            {"key": "def_boost", "label": "+2 DEF (3 games)", "pts": 4, "stat": "defense", "amount": 2, "games": 3, "teamwide": False},
+            {"key": "spd_boost", "label": "+2 SPD (3 games)", "pts": 4, "stat": "speed", "amount": 2, "games": 3, "teamwide": False},
+            {"key": "team_atk", "label": "+1 ATK (team, 2 games)", "pts": 6, "stat": "attack", "amount": 1, "games": 2, "teamwide": True},
+            {"key": "stamina_reset", "label": "Reset fatigue (1 card)", "pts": 3, "stat": "stamina_reset", "amount": 0, "games": 0, "teamwide": False},
+        ]
+
+    def purchase_boost(self, team_idx: int, item_key: str, target_card: Optional[str] = None) -> Tuple[bool, str]:
+        team = self.teams[team_idx]
+        item = next((x for x in self.shop_catalog if x["key"] == item_key), None)
+        if not item:
+            return False, "Item not found."
+        if team.shop_points_left < item["pts"]:
+            return False, "Not enough shop points."
+        # Target needed for non-teamwide boosts (except teamwide items)
+        if not item["teamwide"] and item["stat"] != "stamina_reset" and not target_card:
+            return False, "Select a target card."
+        team.shop_points_left -= float(item["pts"])
+        boost = {
+            "key": item["key"],
+            "stat": item["stat"],
+            "amount": item["amount"],
+            "teamwide": item["teamwide"],
+            "games_left": item["games"],
+        }
+        if target_card:
+            boost["target"] = target_card
+        team.boosts.append(boost)
+        self.transactions.append(f"{team.name} purchased {item['label']}")
+        return True, f"{team.name} purchased {item['label']}"
+
+    # ---------------------- Season Flow ----------------------
+    def start_preseason(self) -> None:
+        """Create cards/teams if missing, then draft 3+1 per team under cap.
+        Also regenerates schedule and resets team records.
+        """
+        if not self.cards:
+            self._generate_initial_cards(target=160)
+        if not self.teams:
+            self._generate_teams(n=30)
+        # reset team records
+        for T in self.teams:
+            T.wins = T.losses = T.streak = 0
+            T.roster = []
+            T.backup = None
+            T.boosts = []
+            T.trades_used = 0
+            T.cost_spent = 0.0
+            T.shop_points_left = 0.0
+        # perform draft
+        self._fantasy_draft()
+        # calendar & rivalries
+        self.generate_calendar()
+        self._initialize_rivalries()
+
+    def generate_calendar(self) -> None:
+        """20 weeks with 40 total regular-season game days.
+        We'll schedule 1 game per day, pairing random teams (no repeats heavy enforcement).
+        """
+        self.schedule = []
+        n_days = 40
+        n_teams = len(self.teams)
+        for d in range(1, n_days + 1):
+            a, b = random.sample(range(n_teams), 2)
+            self.schedule.append((d, a, b))
+        self.day = 1
+
+    def _initialize_rivalries(self) -> None:
+        self.rivalries = {}
+        for (d, a, b) in self.schedule:
+            key = (min(a, b), max(a, b))
+            if key not in self.rivalries:
+                self.rivalries[key] = {"games": 0, "a_wins": 0, "b_wins": 0}
+            self.rivalries[key]["games"] += 1
+
+    # ---------------------- Simulation ----------------------
+    def simulate_next_day(self) -> List[Dict]:
+        games = [g for g in self.schedule if g[0] == self.day]
+        recaps: List[Dict] = []
+        if not games:
+            # still advance day until end of schedule
+            if not self.season_complete():
+                self.day += 1
+            return recaps
+        for _, a, b in games:
+            home = self.teams[a]
+            away = self.teams[b]
+            hs, ascore, detail = self._simulate_match(a, b)
+            if hs > ascore:
+                self._apply_result(home, away, winner_is_home=True)
+                winner = home.name
+                # rivalry stats
+                self._bump_rivalry(a, b, a_win=True)
+            else:
+                self._apply_result(home, away, winner_is_home=False)
+                winner = away.name
+                self._bump_rivalry(a, b, a_win=False)
+            recap = {
+                "day": self.day,
+                "home": home.name,
+                "away": away.name,
+                "home_score": hs,
+                "away_score": ascore,
+                "winner": winner,
+                "comment": detail,
+            }
+            self.results.append(recap)
+            recaps.append(recap)
+        self.day += 1
+        return recaps
+
+    def _apply_result(self, home: Team, away: Team, winner_is_home: bool) -> None:
+        if winner_is_home:
+            home.wins += 1
+            home.streak = home.streak + 1 if home.streak >= 0 else 1
+            away.losses += 1
+            away.streak = away.streak - 1 if away.streak <= 0 else -1
+        else:
+            away.wins += 1
+            away.streak = away.streak + 1 if away.streak >= 0 else 1
+            home.losses += 1
+            home.streak = home.streak - 1 if home.streak <= 0 else -1
+
+    def _bump_rivalry(self, a_idx: int, b_idx: int, a_win: bool) -> None:
+        key = (min(a_idx, b_idx), max(a_idx, b_idx))
+        rv = self.rivalries.get(key)
+        if not rv:
+            rv = {"games": 0, "a_wins": 0, "b_wins": 0}
+            self.rivalries[key] = rv
+        rv["games"] += 0  # already incremented at schedule creation
+        if a_idx < b_idx:
+            if a_win:
+                rv["a_wins"] += 1
+            else:
+                rv["b_wins"] += 1
+        else:
+            if a_win:
+                rv["b_wins"] += 1
+            else:
+                rv["a_wins"] += 1
+
+    def _simulate_match(self, home_idx: int, away_idx: int) -> Tuple[int, int, str]:
+        home = self.teams[home_idx]
+        away = self.teams[away_idx]
+
+        def card_power(c: Card) -> float:
+            return c.attack + c.defense + c.speed + c.stamina + c.special
+
+        def apply_boosts(team: Team, base: float) -> float:
+            bonus = 0.0
+            to_remove = []
+            for b in team.boosts:
+                if b.get("games_left", 0) <= 0:
+                    continue
+                if b["teamwide"]:
+                    # +amount per starter
+                    bonus += float(b["amount"]) * 3.0
+                else:
+                    # single card boost → approximate +amount
+                    bonus += float(b["amount"]) * 1.0
+                b["games_left"] -= 1
+                if b["games_left"] <= 0:
+                    to_remove.append(b)
+            # cleanup expired
+            for b in to_remove:
+                try:
+                    team.boosts.remove(b)
+                except ValueError:
+                    pass
+            return base + bonus
+
+        def team_strength(T: Team) -> float:
+            base = 0.0
+            # Sum starters
+            for cid in T.roster:
+                c = self.cards.get(cid)
+                if not c or c.retired:
+                    continue
+                base += card_power(c)
+            # Backup may sub if a random fatigue check triggers (simple model)
+            if T.backup and random.random() < 0.15:
+                cbu = self.cards.get(T.backup)
+                if cbu and not cbu.retired:
+                    base += 0.25 * card_power(cbu)
+            # apply boosts
+            base = apply_boosts(T, base)
+            return base
+
+        hs = int(team_strength(home) / 25.0 + random.randint(0, 10))
+        ascore = int(team_strength(away) / 25.0 + random.randint(0, 10))
+        detail = "Regular season clash"
+        return hs, ascore, detail
+
+    def season_complete(self) -> bool:
+        return self.day > (self.schedule[-1][0] if self.schedule else 0)
+
+    # ---------------------- Playoffs ----------------------
+    def start_playoffs(self) -> None:
+        # Seed top 16 by wins (ties arbitrary)
+        order = sorted(range(len(self.teams)), key=lambda i: self.teams[i].wins, reverse=True)
+        seeds = order[:16]
+        # Round pairs 1v16, 8v9, etc.
+        pairs = []
+        for i in range(8):
+            pairs.append((seeds[i], seeds[15 - i]))
+        self.playoffs = {
+            "round": 1,
+            "round_lengths": {1: 3, 2: 5, 3: 5, 4: 7},  # Bo3, Bo5, Bo5, Bo7
+            "pairs": pairs,
+            "series": {f"{a}-{b}": {"a_wins": 0, "b_wins": 0} for a, b in pairs},
+            "results": [],
+            "champion": None,
+        }
+
+    def simulate_playoffs_to_champion(self) -> Optional[int]:
+        if not self.playoffs:
+            return None
+        while self.playoffs.get("champion") is None:
+            self._simulate_playoff_round()
+        champ_name = self.playoffs.get("champion")
+        for i, T in enumerate(self.teams):
+            if T.name == champ_name:
+                return i
+        return None
+
+    def _simulate_playoff_round(self) -> None:
+        r = int(self.playoffs.get("round", 1))
+        length = self.playoffs["round_lengths"].get(r, 7)
+        pairs = list(self.playoffs.get("pairs", []))
+        winners: List[int] = []
+        for a, b in pairs:
+            key = f"{a}-{b}"
+            series = self.playoffs["series"].get(key, {"a_wins": 0, "b_wins": 0})
+            a_wins = series["a_wins"]
+            b_wins = series["b_wins"]
+            # play until someone reaches majority
+            needed = (length // 2) + 1
+            while a_wins < needed and b_wins < needed:
+                hs, ascore, _ = self._simulate_match(a, b)
+                if hs > ascore:
+                    a_wins += 1
+                else:
+                    b_wins += 1
+            series["a_wins"], series["b_wins"] = a_wins, b_wins
+            self.playoffs["series"][key] = series
+            self.playoffs["results"].append({
+                "round": r,
+                "A": self.teams[a].name,
+                "B": self.teams[b].name,
+                "best_of": length,
+                "final": f"{a_wins}-{b_wins}",
+                "winner": self.teams[a].name if a_wins > b_wins else self.teams[b].name,
+            })
+            winners.append(a if a_wins > b_wins else b)
+        if len(winners) == 1:
+            self.playoffs["champion"] = self.teams[winners[0]].name
+            return
+        # next round re-seed bracket style
+        next_pairs = []
+        for i in range(0, len(winners), 2):
+            if i + 1 < len(winners):
+                next_pairs.append((winners[i], winners[i + 1]))
+        self.playoffs["round"] = r + 1
+        self.playoffs["pairs"] = next_pairs
+        self.playoffs["series"] = {f"{a}-{b}": {"a_wins": 0, "b_wins": 0} for a, b in next_pairs}
+
+    # ---------------------- Awards / Patch / Lifecycle ----------------------
+    def calculate_awards(self, champion_idx: Optional[int]) -> Dict:
+        """Very light-weight awards to satisfy UI needs (can be expanded)."""
+        awards = {"MVP": None}
+        # MVP: strongest card on best regular-season team
+        best_team_idx = max(range(len(self.teams)), key=lambda i: self.teams[i].wins)
+        best_team = self.teams[best_team_idx]
+        best_cid = None
+        best_power = -1
+        for cid in best_team.roster:
+            c = self.cards.get(cid)
+            if not c:
+                continue
+            p = c.attack + c.defense + c.speed + c.stamina + c.special
+            if p > best_power:
+                best_power = p
+                best_cid = cid
+        if best_cid:
+            awards["MVP"] = best_cid
+            self.cards[best_cid].awards.append("MVP")
+        # Finals MVP if champion known: top power on champion roster
+        if champion_idx is not None:
+            champ = self.teams[champion_idx]
+            top_cid = None
+            top_pow = -1
+            for cid in champ.roster:
+                c = self.cards.get(cid)
+                if not c:
+                    continue
+                p = c.attack + c.defense + c.speed + c.stamina + c.special
+                if p > top_pow:
+                    top_pow = p
+                    top_cid = cid
+            if top_cid:
+                self.cards[top_cid].awards.append("Finals MVP")
+                awards["Finals MVP"] = top_cid
+        return awards
+
+    def adjust_costs(self, awards: Dict) -> None:
+        # Simple economics: MVP +1.5 cost, others -0.2 floor 1
+        for c in self.cards.values():
+            if c.retired:
+                continue
+            if any(a in c.awards for a in ("MVP", "Finals MVP")):
+                c.cost = min(10.0, c.cost + 1.5)
+            else:
+                c.cost = max(1.0, c.cost - 0.2)
+
+    def apply_patch(self) -> Dict:
+        """Random buffs/nerfs each season to keep meta shifting."""
+        patch = {"buffs": [], "nerfs": []}
+        for c in self.cards.values():
+            if c.retired:
+                continue
+            r = random.random()
+            if r < 0.05:  # nerf
+                delta = random.randint(1, 3)
+                c.attack = max(1, c.attack - delta)
+                patch["nerfs"].append({"card": c.name, "attack": -delta})
+            elif r < 0.10:  # buff
+                delta = random.randint(1, 3)
+                c.attack = min(100, c.attack + delta)
+                patch["buffs"].append({"card": c.name, "attack": +delta})
+        return patch
+
+    def retire_and_add_rookies(self) -> Tuple[List[Dict], List[Dict]]:
+        """Age everyone, retire ~3, add 4 rookies, keep total between 160–170."""
+        retired: List[Dict] = []
+        for c in self.cards.values():
+            if c.retired:
+                continue
+            c.age += 1
+            if c.age >= c.lifespan and random.random() < 0.6:
+                c.retired = True
+                retired.append({"id": c.id, "name": c.name})
+        # Ensure at least 3 retirements if pool is big
+        actives = [c for c in self.cards.values() if not c.retired]
+        need_force = max(0, 3 - len(retired)) if len(actives) > 100 else 0
+        if need_force:
+            force_list = random.sample([c for c in actives if c.age >= c.lifespan - 1], k=min(need_force, len(actives)))
+            for c in force_list:
+                c.retired = True
+                retired.append({"id": c.id, "name": c.name})
+        # Add 4 rookies
+        rookies: List[Dict] = []
+        for i in range(4):
+            cid = f"S{self.season}_R{i}_{random.randint(1000,9999)}"
+            archetype = random.choice(["Tank", "DPS", "Control", "Support", "Hybrid"])
+            atk, dfn, spd, sta, spc = [random.randint(45, 75) for _ in range(5)]
+            cost = self._cost_from_power(atk + dfn + spd + sta + spc)
+            life = random.randint(3, 8)
+            c = Card(cid, f"Rookie {i}", archetype, random.choice(["Melee", "Ranged"]), atk, dfn, spd, sta, spc, cost, age=0, lifespan=life, retired=False)
+            self.cards[cid] = c
+            rookies.append({"id": c.id, "name": c.name})
+        # Clamp total 160–170 by retiring oldest extras if needed
+        total = len(self.cards)
+        if total > 170:
+            extras = total - 170
+            candidates = sorted([c for c in self.cards.values() if not c.retired], key=lambda x: (x.age, x.cost), reverse=True)
+            for c in candidates[:extras]:
+                c.retired = True
+                retired.append({"id": c.id, "name": c.name})
+        return retired, rookies
+
+    def archive_season(self, awards: Dict, patch: Dict, retired: List[Dict], rookies: List[Dict], champ_idx: Optional[int]) -> None:
+        self.past_seasons[self.season] = {
+            "standings": self.standings_table(),
+            "awards": awards,
+            "patch_notes": patch,
+            "retirements": retired,
+            "rookies": rookies,
+            "playoffs": self.playoffs,
+            "transactions": list(self.transactions),
+        }
+
+    # ---------------------- Standings ----------------------
+    def standings_table(self) -> List[Dict]:
+        return [
+            {"Team": t.name, "W": t.wins, "L": t.losses, "Streak": t.streak}
+            for t in self.teams
+        ]
+
+    # ---------------------- Trades ----------------------
+    def trade_finder_offers(self, own_team_idx: int, my_card_id: str) -> List[Dict]:
+        """Return simple 1-for-1 offers that keep both teams under the cap."""
+        offers: List[Dict] = []
+        my_team = self.teams[own_team_idx]
+        my_cost_minus = self.cards.get(my_card_id).cost if my_card_id in self.cards else 0.0
+        for j, other in enumerate(self.teams):
+            if j == own_team_idx:
+                continue
+            # consider their starters and backup
+            pool = list(other.roster)
+            if other.backup:
+                pool.append(other.backup)
+            for their_id in pool:
+                c_their = self.cards.get(their_id)
+                if not c_their or c_their.retired:
+                    continue
+                # compute hypothetical costs
+                my_new_cost = my_team.cost_spent - my_cost_minus + c_their.cost
+                their_new_cost = other.cost_spent - c_their.cost + my_cost_minus
+                if my_new_cost <= self.max_team_cost and their_new_cost <= self.max_team_cost:
+                    offers.append({
+                        "team_name": other.name,
+                        "team_idx": j,
+                        "their_card": their_id,
+                        "their_card_name": c_their.name,
+                        "their_cost": c_their.cost,
+                    })
+        # Return up to 10 offers
+        random.shuffle(offers)
+        return offers[:10]
+
+    def execute_trade(self, own_team_idx: int, my_card_id: str, other_team_idx: int, their_card_id: str) -> Tuple[bool, str]:
+        A = self.teams[own_team_idx]
+        B = self.teams[other_team_idx]
+        if A.trades_used >= 1:
+            return False, "You have already used your card trade this season."
+        if my_card_id not in A.roster and my_card_id != A.backup:
+            return False, "You don't own that card."
+        if their_card_id not in B.roster and their_card_id != B.backup:
+            return False, "Other team doesn't own that card."
+        ca = self.cards.get(my_card_id)
+        cb = self.cards.get(their_card_id)
+        if not ca or not cb:
+            return False, "Card not found."
+        # compute new costs
+        new_cost_A = A.cost_spent - ca.cost + cb.cost
+        new_cost_B = B.cost_spent - cb.cost + ca.cost
+        if new_cost_A > self.max_team_cost or new_cost_B > self.max_team_cost:
+            return False, "Trade breaks salary cap."
+        # swap (prefer swapping in starters if present; otherwise touch backup)
+        def swap(team: Team, give_id: str, get_id: str) -> None:
+            if give_id in team.roster:
+                idx = team.roster.index(give_id)
+                team.roster[idx] = get_id
+            elif team.backup == give_id:
+                team.backup = get_id
+
+        swap(A, my_card_id, their_card_id)
+        swap(B, their_card_id, my_card_id)
+        A.cost_spent = new_cost_A
+        B.cost_spent = new_cost_B
+        A.trades_used += 1
+        self.transactions.append(f"TRADE: {A.name} sent {ca.name} for {cb.name} from {B.name}")
+        return True, "Trade executed."
+
+    # ---------------------- Utilities ----------------------
+    def reset_new_league(self) -> None:
+        self.__init__()
+        self.start_preseason()
+
+    def run_full_season_if_needed(self) -> None:
+        while not self.season_complete():
+            self.simulate_next_day()
+        champ_idx = None
+        if not self.playoffs:
+            self.start_playoffs()
+        champ_idx = self.simulate_playoffs_to_champion()
+        awards = self.calculate_awards(champ_idx)
+        self.adjust_costs(awards)
+        patch = self.apply_patch()
+        retired, rookies = self.retire_and_add_rookies()
+        self.archive_season(awards, patch, retired, rookies, champ_idx)
+        # advance to next season
+        self.season += 1
+        self.results = []
+        self.transactions = []
+        self.playoffs = {}
+        self.start_preseason()
+
+    # ======================================================
+    # Internal helpers
+    # ======================================================
+    def _generate_initial_cards(self, target: int = 160) -> None:
+        """Generate a pool of cards with varied archetypes and lifespans.
+        Costs scale loosely with total power so drafting fits a 20-point cap.
+        """
+        names = self._seed_card_names(target)
+        for i in range(target):
+            cid = f"C{i:03d}"
+            name = names[i]
+            archetype = random.choice(["Tank", "DPS", "Control", "Support", "Hybrid"])
+            atk = random.randint(45, 90)
+            dfn = random.randint(45, 90)
+            spd = random.randint(45, 90)
+            sta = random.randint(45, 90)
+            spc = random.randint(45, 90)
+            cost = self._cost_from_power(atk + dfn + spd + sta + spc)
+            life = random.randint(3, 8)
+            card = Card(
+                cid,
+                name,
+                archetype,
+                random.choice(["Melee", "Ranged"]),
+                atk,
+                dfn,
+                spd,
+                sta,
+                spc,
+                cost,
+                lifespan=life,
+            )
+            self.cards[cid] = card
+
+    def _cost_from_power(self, power: int) -> float:
+        # Map total stat 225–450 roughly to cost 3.0–9.0, then clamp 1–10
+        x = 3.0 + (power - 225) / 225.0 * 6.0
+        return float(max(1.0, min(10.0, round(x, 1))))
+
+    def _generate_teams(self, n: int = 30) -> None:
+        logos = ["🐲", "🦅", "🦁", "🐺", "🦂", "🦄", "🐯", "🐻", "🦊", "🐼", "🐮", "🐵", "🦉", "🐗", "🐸"]
+        styles = ["aggressive", "balanced", "cautious", "chaotic", "methodical"]
+        for i in range(n):
+            name = f"Team {chr(65 + (i % 26))}{'' if i < 26 else i}"
+            logo = random.choice(logos)
+            gm = random.choice(styles)
+            self.teams.append(Team(name, logo, gm))
+
+    def _fantasy_draft(self) -> None:
+        """Each team drafts 3 starters + 1 backup under the 20-point cap.
+        Draft order snake-style by random order.
+        """
+        # candidate pool: active cards only
+        pool = [c for c in self.cards.values() if not c.retired]
+        random.shuffle(pool)
+        order = list(range(len(self.teams)))
+        random.shuffle(order)
+        rounds = 4  # 3 starters + 1 backup
+        for r in range(rounds):
+            order_iter = order if r % 2 == 0 else list(reversed(order))
+            for ti in order_iter:
+                T = self.teams[ti]
+                # pick best affordable
+                pick = self._best_affordable_card(pool, T.cost_spent, self.max_team_cost)
+                if not pick:
+                    # if no affordable left, pick the cheapest remaining
+                    if not pool:
+                        continue
+                    pick = min(pool, key=lambda c: c.cost)
+                # assign
+                if r < 3:
+                    T.roster.append(pick.id)
+                else:
+                    T.backup = pick.id
+                T.cost_spent += pick.cost
+                # remove from pool
+                pool.remove(pick)
+        # compute leftover -> shop points
+        for T in self.teams:
+            T.shop_points_left = max(0.0, round(self.max_team_cost - T.cost_spent, 2))
+
+    def _best_affordable_card(self, pool: List[Card], current_cost: float, cap: float) -> Optional[Card]:
+        affordable = [c for c in pool if current_cost + c.cost <= cap]
+        if not affordable:
+            return None
+        # choose by highest total power
+        return max(affordable, key=lambda c: c.attack + c.defense + c.speed + c.stamina + c.special)
